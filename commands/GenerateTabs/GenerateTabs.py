@@ -2,16 +2,13 @@ import adsk.core
 import adsk.fusion
 import traceback
 
-from ...lib import geometry
 from ...lib import layout as layout_mod
-from ...lib import sketch_builder
-from ...lib import cut_builder
 
 # Command identifiers
 CMD_ID = 'tabberGenerateTabs'
-CMD_NAME = 'Generate Tabs'
+CMD_NAME = 'Tabber'
 CMD_TOOLTIP = 'Add finger-joint tabs to a face'
-PANEL_ID = 'SolidScriptsAddinsPanel'
+PANEL_ID = 'SolidModifyPanel'
 
 # Keep handler references alive
 _handlers = []
@@ -35,7 +32,9 @@ def register(ui):
         existing_ctrl = panel.controls.itemById(CMD_ID)
         if existing_ctrl:
             existing_ctrl.deleteMe()
-        panel.controls.addCommand(cmd_def)
+        ctrl = panel.controls.addCommand(cmd_def)
+        ctrl.isPromotedByDefault = True
+        ctrl.isPromoted = True
 
     return cmd_def
 
@@ -66,29 +65,12 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             cmd = adsk.core.Command.cast(args.command)
             inputs = cmd.commandInputs
 
-            # Placement dropdown
-            placement_input = inputs.addDropDownCommandInput(
-                'placementInput', 'Placement',
-                adsk.core.DropDownStyles.TextListDropDownStyle,
-            )
-            placement_input.listItems.add('Dual Edge', True)
-            placement_input.listItems.add('Single Edge', False)
-
-            # Primary face selection
+            # Face selection
             face_input = inputs.addSelectionInput(
                 'faceSelectInput', 'Face', 'Select a planar face',
             )
             face_input.addSelectionFilter('PlanarFaces')
             face_input.setSelectionLimits(1, 1)
-
-            # Secondary face selection (for dual mode)
-            secondary_input = inputs.addSelectionInput(
-                'secondaryFaceInput', 'Secondary Face',
-                'Select the opposite face (auto-detected if possible)',
-            )
-            secondary_input.addSelectionFilter('PlanarFaces')
-            secondary_input.setSelectionLimits(0, 1)
-            secondary_input.isVisible = True  # Dual is default
 
             # Tab count
             inputs.addIntegerSpinnerCommandInput(
@@ -109,12 +91,6 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'mm', 0.1, 1000.0, 0.5, 8.0,
             )
             tab_width_input.isVisible = False  # Hidden when Automatic
-
-            # Warning message (hidden by default)
-            warning_input = inputs.addTextBoxCommandInput(
-                'warningMsgInput', '', '', 2, True,
-            )
-            warning_input.isVisible = False
 
             # Register event handlers
             on_execute = TabberExecuteHandler()
@@ -166,14 +142,12 @@ class TabberExecuteHandler(adsk.core.CommandEventHandler):
             width_mode_input = inputs.itemById('widthModeInput')
             width_mode_name = width_mode_input.selectedItem.name
 
-            placement_input = inputs.itemById('placementInput')
-            placement_name = placement_input.selectedItem.name
-
             tab_width_input = inputs.itemById('tabWidthInput')
             # Fusion stores float spinner values in internal units (cm)
             manual_width_cm = tab_width_input.value
 
             # Get face dimensions
+            from ...lib import geometry
             dims = geometry.get_face_dimensions(face)
 
             # Calculate layout
@@ -193,67 +167,26 @@ class TabberExecuteHandler(adsk.core.CommandEventHandler):
                     del sys.modules[mod_name]
             from ...lib import geometry as _geo, sketch_builder as _sb, cut_builder as _cb
 
-            # Build sketch and cuts on primary face
-            sketch = _sb.build_tab_sketch(
+            # Record timeline position before creating geometry
+            timeline = design.timeline
+            start_index = timeline.count
+
+            # Build parametric sketch and cuts on primary face
+            sketch, suffix = _sb.build_tab_sketch(
                 component, face, tab_layout, dims["height_cm"],
+                width_mode=width_mode,
+                tab_count=tab_count,
+                manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
             )
-            _cb.build_cuts(component, face, sketch, dims["height_cm"])
+            _cb.build_cuts(component, face, sketch, dims["height_cm"],
+                           param_suffix=suffix)
 
-            # If dual mode, build mirror cuts on opposite face
-            if placement_name == 'Dual Edge':
-                secondary_input = inputs.itemById('secondaryFaceInput')
-                if secondary_input.selectionCount > 0:
-                    opposite = secondary_input.selection(0).entity
-                    opp_component = opposite.body.parentComponent
-
-                    # Get primary sketch bounds from its line endpoints
-                    # (primary face entity is invalid after cuts)
-                    pri_min_x, pri_max_x = float('inf'), float('-inf')
-                    pri_min_y, pri_max_y = float('inf'), float('-inf')
-                    pri_lines = sketch.sketchCurves.sketchLines
-                    for li in range(pri_lines.count):
-                        ln = pri_lines.item(li)
-                        for pt in [ln.startSketchPoint.geometry, ln.endSketchPoint.geometry]:
-                            pri_min_x = min(pri_min_x, pt.x)
-                            pri_max_x = max(pri_max_x, pt.x)
-                            pri_min_y = min(pri_min_y, pt.y)
-                            pri_max_y = max(pri_max_y, pt.y)
-
-                    pri_w = pri_max_x - pri_min_x
-                    pri_h = pri_max_y - pri_min_y
-                    pri_length_is_x = (pri_w >= pri_h)
-
-                    # Create sketch on opposite face
-                    try:
-                        opp_sketch = opp_component.sketches.addWithoutEdges(opposite)
-                    except AttributeError:
-                        opp_sketch = opp_component.sketches.add(opposite)
-                    opp_sketch.name = "Tabber mirror cuts"
-
-                    # For each primary TAB (= mirror notch/cut),
-                    # map corners through model space to opposite sketch space
-                    for seg in tab_layout["segments"]:
-                        if seg["type"] != "notch":
-                            continue
-                        if pri_length_is_x:
-                            sx1, sy1 = pri_min_x + seg["start_cm"], pri_min_y
-                            sx2, sy2 = pri_min_x + seg["end_cm"], pri_max_y
-                        else:
-                            sx1, sy1 = pri_min_x, pri_min_y + seg["start_cm"]
-                            sx2, sy2 = pri_max_x, pri_min_y + seg["end_cm"]
-
-                        m1 = sketch.sketchToModelSpace(adsk.core.Point3D.create(sx1, sy1, 0))
-                        m2 = sketch.sketchToModelSpace(adsk.core.Point3D.create(sx2, sy2, 0))
-                        o1 = opp_sketch.modelToSketchSpace(m1)
-                        o2 = opp_sketch.modelToSketchSpace(m2)
-
-                        opp_sketch.sketchCurves.sketchLines.addTwoPointRectangle(
-                            adsk.core.Point3D.create(min(o1.x, o2.x), min(o1.y, o2.y), 0),
-                            adsk.core.Point3D.create(max(o1.x, o2.x), max(o1.y, o2.y), 0),
-                        )
-
-                    # Cut the opposite face
-                    _cb.build_cuts(opp_component, opposite, opp_sketch, dims["height_cm"])
+            # Group all new timeline items with descriptive name
+            end_index = timeline.count - 1
+            if end_index > start_index:
+                group = timeline.timelineGroups.add(start_index, end_index)
+                group_num = suffix.replace("_", "") if suffix else "1"
+                group.name = f"Tabs {group_num}"
 
         except layout_mod.LayoutError as e:
             app = adsk.core.Application.get()
@@ -264,7 +197,7 @@ class TabberExecuteHandler(adsk.core.CommandEventHandler):
 
 
 class TabberInputChangedHandler(adsk.core.InputChangedEventHandler):
-    """Shows/hides inputs and triggers opposite face auto-detection."""
+    """Shows/hides tab width input based on width mode."""
 
     def __init__(self):
         super().__init__()
@@ -276,43 +209,10 @@ class TabberInputChangedHandler(adsk.core.InputChangedEventHandler):
 
             width_mode_input = inputs.itemById('widthModeInput')
             tab_width_input = inputs.itemById('tabWidthInput')
-            placement_input = inputs.itemById('placementInput')
-            secondary_input = inputs.itemById('secondaryFaceInput')
-            face_input = inputs.itemById('faceSelectInput')
-            warning_input = inputs.itemById('warningMsgInput')
 
             # Toggle manual tab width visibility
             is_manual = width_mode_input.selectedItem.name == 'Manual'
             tab_width_input.isVisible = is_manual
-
-            # Toggle secondary face visibility
-            is_dual = placement_input.selectedItem.name == 'Dual Edge'
-            secondary_input.isVisible = is_dual
-
-            # Auto-detect opposite face when primary face changes in dual mode
-            if changed_input.id == 'faceSelectInput' and is_dual:
-                warning_input.isVisible = False
-
-                if face_input.selectionCount > 0:
-                    face = face_input.selection(0).entity
-                    app = adsk.core.Application.get()
-                    design = adsk.fusion.Design.cast(app.activeProduct)
-                    component = design.activeComponent
-
-                    opposite = geometry.find_opposite_face(face, component)
-                    if opposite:
-                        secondary_input.clearSelection()
-                        secondary_input.addSelection(opposite)
-                    else:
-                        warning_input.formattedText = (
-                            'No opposite face detected. '
-                            'Switch to Single Edge or select manually.'
-                        )
-                        warning_input.isVisible = True
-
-            # Hide warning when switching to single mode
-            if changed_input.id == 'placementInput' and not is_dual:
-                warning_input.isVisible = False
 
         except Exception:
             pass  # Don't crash on input change events
