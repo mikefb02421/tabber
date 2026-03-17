@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "com.autodesk.fusion360.tabber",
+    "author": "",
+    "description": {
+        "": "Generates finger-joint (box joint) tabs on plywood box faces."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
