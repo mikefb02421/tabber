@@ -165,17 +165,28 @@ def build_tab_sketch(component, face, layout, depth_cm, label="Tabber cuts",
         except Exception:
             pass
 
-        # Collinear: rectangle top line with projected top edge
-        try:
-            constraints.addCollinear(info['top_line'], proj['top_line'])
-        except Exception:
-            pass
-
-        # Collinear: rectangle bottom line with projected bottom edge
-        try:
-            constraints.addCollinear(info['bottom_line'], proj['bottom_line'])
-        except Exception:
-            pass
+        # Collinear: tie rectangle edges spanning the height direction
+        # to the corresponding projected face edges
+        if length_is_x:
+            # Height along Y — constrain top/bottom
+            try:
+                constraints.addCollinear(info['top_line'], proj['top_line'])
+            except Exception:
+                pass
+            try:
+                constraints.addCollinear(info['bottom_line'], proj['bottom_line'])
+            except Exception:
+                pass
+        else:
+            # Height along X — constrain left/right
+            try:
+                constraints.addCollinear(info['left_line'], proj['left_line'])
+            except Exception:
+                pass
+            try:
+                constraints.addCollinear(info['right_line'], proj['right_line'])
+            except Exception:
+                pass
 
     # Anchor first rectangle's leading edge to projected leading edge
     if rect_infos:
