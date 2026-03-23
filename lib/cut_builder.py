@@ -48,3 +48,35 @@ def build_cuts(component, face, sketch, depth_cm, param_suffix=""):
         features.append(feature)
 
     return features
+
+
+def build_hole_cuts(component, face, sketch):
+    """
+    For each closed profile in `sketch`, create an extrude-cut with
+    Through All extent, restricted to the target body only.
+
+    Returns list of created ExtrudeFeature objects.
+    """
+    features = []
+    extrudes = component.features.extrudeFeatures
+
+    profile_count = sketch.profiles.count
+    if profile_count == 0:
+        return features
+
+    target_body = face.body
+
+    for pi in range(profile_count):
+        profile = sketch.profiles.item(pi)
+
+        ext_input = extrudes.createInput(
+            profile,
+            adsk.fusion.FeatureOperations.CutFeatureOperation,
+        )
+        ext_input.setAllExtent(adsk.fusion.ExtentDirections.NegativeExtentDirection)
+        ext_input.participantBodies = [target_body]
+
+        feature = extrudes.add(ext_input)
+        features.append(feature)
+
+    return features

@@ -241,6 +241,169 @@ def build_tab_sketch(component, face, layout, depth_cm, label="Tabber cuts",
     return sketch, suffix
 
 
+def build_pilot_hole_sketch(component, top_face, edge, layout,
+                            board_thickness_cm, hole_diameter_cm,
+                            suffix="", label="Tabber pilot holes"):
+    """
+    Create a parametric sketch on `top_face` with pilot hole circles at each
+    notch center, offset from the edge by half the board thickness.
+
+    Returns the Sketch object.
+    """
+    app = adsk.core.Application.get()
+    design = adsk.fusion.Design.cast(app.activeProduct)
+
+    # --- Create sketch on top face ---
+    try:
+        sketch = component.sketches.addWithoutEdges(top_face)
+    except AttributeError:
+        sketch = component.sketches.add(top_face)
+    sketch.name = label
+
+    # --- Project the selected edge as a construction line ---
+    projected = sketch.project(edge)
+    proj_line = None
+    for j in range(projected.count):
+        item = projected.item(j)
+        item.isConstruction = True
+        if hasattr(item, 'startSketchPoint'):
+            proj_line = item
+    if proj_line is None:
+        raise RuntimeError("Tabber: could not project edge into pilot hole sketch.")
+
+    # --- Determine edge direction and perpendicular inward direction ---
+    sp = proj_line.startSketchPoint.geometry
+    ep = proj_line.endSketchPoint.geometry
+    edge_dx = ep.x - sp.x
+    edge_dy = ep.y - sp.y
+    edge_len = (edge_dx**2 + edge_dy**2) ** 0.5
+
+    if edge_len < 1e-8:
+        raise RuntimeError("Tabber: projected edge has zero length.")
+
+    # Unit vector along the edge
+    ux = edge_dx / edge_len
+    uy = edge_dy / edge_len
+
+    # Two candidate perpendicular directions
+    perp1_x, perp1_y = -uy, ux
+    perp2_x, perp2_y = uy, -ux
+
+    # Pick the one that points "inward" (toward the face center)
+    # Get face center in sketch space via bounding box
+    bbox = top_face.boundingBox
+    face_center_world = adsk.core.Point3D.create(
+        (bbox.minPoint.x + bbox.maxPoint.x) / 2,
+        (bbox.minPoint.y + bbox.maxPoint.y) / 2,
+        (bbox.minPoint.z + bbox.maxPoint.z) / 2,
+    )
+    # Transform face center to sketch coordinates
+    transform = sketch.transform
+    transform.invert()
+    face_center_sketch = face_center_world.copy()
+    face_center_sketch.transformBy(transform)
+
+    # Test point at edge midpoint + perpendicular offset
+    edge_mid_x = (sp.x + ep.x) / 2
+    edge_mid_y = (sp.y + ep.y) / 2
+    test_offset = board_thickness_cm  # use full thickness for clear discrimination
+
+    test1_x = edge_mid_x + perp1_x * test_offset
+    test1_y = edge_mid_y + perp1_y * test_offset
+    test2_x = edge_mid_x + perp2_x * test_offset
+    test2_y = edge_mid_y + perp2_y * test_offset
+
+    d1 = (test1_x - face_center_sketch.x)**2 + (test1_y - face_center_sketch.y)**2
+    d2 = (test2_x - face_center_sketch.x)**2 + (test2_y - face_center_sketch.y)**2
+
+    if d1 < d2:
+        perp_x, perp_y = perp1_x, perp1_y
+    else:
+        perp_x, perp_y = perp2_x, perp2_y
+
+    # --- Register hole diameter parameter ---
+    hd_name = f"tabber_hole_diameter{suffix}"
+    register_parameter(design, hd_name, hole_diameter_cm,
+                       comment="Tabber: pilot hole diameter")
+
+    # --- Place circles at each notch center ---
+    notch_segments = [s for s in layout["segments"] if s["type"] == "notch"]
+    circles = sketch.sketchCurves.sketchCircles
+    dims = sketch.sketchDimensions
+    radius_cm = hole_diameter_cm / 2
+    offset_cm = board_thickness_cm / 2
+
+    # Determine dimension orientation based on edge direction
+    # If edge runs mostly along sketch X, along-edge dims are horizontal
+    length_is_x = abs(ux) > abs(uy)
+
+    for i, seg in enumerate(notch_segments):
+        center_along = (seg["start_cm"] + seg["end_cm"]) / 2
+
+        # Position: start of projected edge + center_along * edge_unit + offset * perp
+        cx = sp.x + ux * center_along + perp_x * offset_cm
+        cy = sp.y + uy * center_along + perp_y * offset_cm
+
+        center_pt = adsk.core.Point3D.create(cx, cy, 0)
+        circle = circles.addByCenterRadius(center_pt, radius_cm)
+
+        # --- Add diameter dimension driven by parameter ---
+        try:
+            dia_dim = dims.addDiameterDimension(
+                circle,
+                adsk.core.Point3D.create(cx + radius_cm + 0.5, cy, 0),
+            )
+            dia_dim.parameter.expression = hd_name
+        except Exception:
+            pass
+
+        # --- Add along-edge dimension from projected edge start to circle center ---
+        try:
+            if length_is_x:
+                along_dim = dims.addDistanceDimension(
+                    proj_line.startSketchPoint,
+                    circle.centerSketchPoint,
+                    adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation,
+                    adsk.core.Point3D.create(cx, cy - 0.5, 0),
+                )
+            else:
+                along_dim = dims.addDistanceDimension(
+                    proj_line.startSketchPoint,
+                    circle.centerSketchPoint,
+                    adsk.fusion.DimensionOrientations.VerticalDimensionOrientation,
+                    adsk.core.Point3D.create(cx - 0.5, cy, 0),
+                )
+            # Expression: (i + 0.5) * notch_width + i * tab_width
+            nw_name = f"tabber_notch_width{suffix}"
+            tw_name = f"tabber_tab_width{suffix}"
+            along_dim.parameter.expression = f"({i} + 0.5) * {nw_name} + {i} * {tw_name}"
+        except Exception:
+            pass
+
+        # --- Add perpendicular dimension from projected edge to circle center ---
+        try:
+            if length_is_x:
+                perp_dim = dims.addDistanceDimension(
+                    proj_line.startSketchPoint,
+                    circle.centerSketchPoint,
+                    adsk.fusion.DimensionOrientations.VerticalDimensionOrientation,
+                    adsk.core.Point3D.create(cx - 0.5, cy, 0),
+                )
+            else:
+                perp_dim = dims.addDistanceDimension(
+                    proj_line.startSketchPoint,
+                    circle.centerSketchPoint,
+                    adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation,
+                    adsk.core.Point3D.create(cx, cy - 0.5, 0),
+                )
+            cd_name = f"tabber_cut_depth{suffix}"
+            perp_dim.parameter.expression = f"{cd_name} / 2"
+        except Exception:
+            pass
+
+    return sketch
+
+
 def register_parameter(design, name, value_cm, units="cm", expression=None,
                        comment=None):
     """

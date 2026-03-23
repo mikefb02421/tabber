@@ -11,6 +11,7 @@ class Config:
     DEFAULT_WIDTH_MODE = 'auto'
     DEFAULT_MANUAL_WIDTH = 8.0  # mm
     DEFAULT_PLACEMENT = 'dual'
+    DEFAULT_HOLE_DIAMETER_IN = 0.125  # inches
 
     def __init__(self, app):
         self.app = app
