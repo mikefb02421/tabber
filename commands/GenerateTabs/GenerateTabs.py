@@ -1,5 +1,6 @@
 import adsk.core
 import adsk.fusion
+import os
 import traceback
 
 from ...lib import layout as layout_mod
@@ -8,7 +9,9 @@ from ...lib import layout as layout_mod
 CMD_ID = 'tabberGenerateTabs'
 CMD_NAME = 'Tabber'
 CMD_TOOLTIP = 'Add finger-joint tabs to a face'
-PANEL_ID = 'SolidModifyPanel'
+PANEL_ID = 'SolidCreatePanel'
+RESOURCES_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), 'resources', 'Tabber')
 
 # Keep handler references alive
 _handlers = []
@@ -21,7 +24,7 @@ def register(ui):
     if existing:
         existing.deleteMe()
 
-    cmd_def = cmd_defs.addButtonDefinition(CMD_ID, CMD_NAME, CMD_TOOLTIP)
+    cmd_def = cmd_defs.addButtonDefinition(CMD_ID, CMD_NAME, CMD_TOOLTIP, RESOURCES_DIR)
 
     on_created = TabberCommandCreatedHandler()
     cmd_def.commandCreated.add(on_created)
