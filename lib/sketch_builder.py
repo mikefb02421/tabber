@@ -241,17 +241,25 @@ def build_tab_sketch(component, face, layout, depth_cm, label="Tabber cuts",
     return sketch, suffix
 
 
-def build_pilot_hole_sketch(component, top_face, edge, layout,
-                            board_thickness_cm, hole_diameter_cm,
-                            suffix="", label="Tabber pilot holes"):
+def build_face_edge_sketch(component, top_face, edge, layout,
+                           board_thickness_cm, hole_diameter_cm,
+                           width_mode='auto', tab_count=3,
+                           manual_tab_width_cm=None,
+                           suffix=None, label="Tabber face+edge"):
     """
-    Create a parametric sketch on `top_face` with pilot hole circles at each
-    notch center, offset from the edge by half the board thickness.
+    Create a single parametric sketch on `top_face` containing:
+    - Notch rectangles along the selected edge (notch_width × board_thickness)
+    - Pilot hole circles at each tab center (between notches)
 
-    Returns the Sketch object.
+    All profiles are extruded ThroughAll by the caller via build_hole_cuts().
+
+    Returns (sketch, suffix).
     """
     app = adsk.core.Application.get()
     design = adsk.fusion.Design.cast(app.activeProduct)
+
+    if suffix is None:
+        suffix = _get_param_suffix(design)
 
     # --- Create sketch on top face ---
     try:
@@ -269,7 +277,7 @@ def build_pilot_hole_sketch(component, top_face, edge, layout,
         if hasattr(item, 'startSketchPoint'):
             proj_line = item
     if proj_line is None:
-        raise RuntimeError("Tabber: could not project edge into pilot hole sketch.")
+        raise RuntimeError("Tabber: could not project edge into face+edge sketch.")
 
     # --- Determine edge direction and perpendicular inward direction ---
     sp = proj_line.startSketchPoint.geometry
@@ -290,23 +298,20 @@ def build_pilot_hole_sketch(component, top_face, edge, layout,
     perp2_x, perp2_y = uy, -ux
 
     # Pick the one that points "inward" (toward the face center)
-    # Get face center in sketch space via bounding box
     bbox = top_face.boundingBox
     face_center_world = adsk.core.Point3D.create(
         (bbox.minPoint.x + bbox.maxPoint.x) / 2,
         (bbox.minPoint.y + bbox.maxPoint.y) / 2,
         (bbox.minPoint.z + bbox.maxPoint.z) / 2,
     )
-    # Transform face center to sketch coordinates
     transform = sketch.transform
     transform.invert()
     face_center_sketch = face_center_world.copy()
     face_center_sketch.transformBy(transform)
 
-    # Test point at edge midpoint + perpendicular offset
     edge_mid_x = (sp.x + ep.x) / 2
     edge_mid_y = (sp.y + ep.y) / 2
-    test_offset = board_thickness_cm  # use full thickness for clear discrimination
+    test_offset = board_thickness_cm
 
     test1_x = edge_mid_x + perp1_x * test_offset
     test1_y = edge_mid_y + perp1_y * test_offset
@@ -321,87 +326,284 @@ def build_pilot_hole_sketch(component, top_face, edge, layout,
     else:
         perp_x, perp_y = perp2_x, perp2_y
 
-    # --- Register hole diameter parameter ---
-    hd_name = f"tabber_hole_diameter{suffix}"
-    register_parameter(design, hd_name, hole_diameter_cm,
-                       comment="Tabber: pilot hole diameter")
-
-    # --- Place circles at each notch center ---
-    notch_segments = [s for s in layout["segments"] if s["type"] == "notch"]
-    circles = sketch.sketchCurves.sketchCircles
-    dims = sketch.sketchDimensions
-    radius_cm = hole_diameter_cm / 2
-    offset_cm = board_thickness_cm / 2
-
-    # Determine dimension orientation based on edge direction
-    # If edge runs mostly along sketch X, along-edge dims are horizontal
+    # --- Add driven dimensions on projected edge for parametric tracking ---
     length_is_x = abs(ux) > abs(uy)
+    dims = sketch.sketchDimensions
+    constraints = sketch.geometricConstraints
 
-    for i, seg in enumerate(notch_segments):
-        center_along = (seg["start_cm"] + seg["end_cm"]) / 2
+    edge_length_param = None
+    try:
+        if length_is_x:
+            el_orient = adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation
+            el_text = _midpoint_3d(sp, ep, dy=-1.0)
+        else:
+            el_orient = adsk.fusion.DimensionOrientations.VerticalDimensionOrientation
+            el_text = _midpoint_3d(sp, ep, dx=-1.0)
+        # isDriving=False creates a reference dimension that tracks the
+        # projected geometry and gets an auto-assigned model parameter.
+        edge_dim = dims.addDistanceDimension(
+            proj_line.startSketchPoint, proj_line.endSketchPoint,
+            el_orient, el_text, False,
+        )
+        edge_length_param = edge_dim.parameter.name
+    except Exception:
+        pass
 
-        # Position: start of projected edge + center_along * edge_unit + offset * perp
-        cx = sp.x + ux * center_along + perp_x * offset_cm
-        cy = sp.y + uy * center_along + perp_y * offset_cm
+    # Try to project a board-thickness edge for parametric cut depth.
+    # Find the edge face (the other face on the selected edge, not top_face),
+    # then find a short edge on it (length ≈ board_thickness) and project it.
+    board_thickness_param = None
+    try:
+        edge_face_local = None
+        for fi in range(edge.faces.count):
+            f = edge.faces.item(fi)
+            if f.entityToken != top_face.entityToken:
+                edge_face_local = f
+                break
+        if edge_face_local:
+            for ei in range(edge_face_local.edges.count):
+                e = edge_face_local.edges.item(ei)
+                if e.entityToken == edge.entityToken:
+                    continue
+                if abs(e.length - board_thickness_cm) > 0.01:
+                    continue
+                proj_th = sketch.project(e)
+                for j in range(proj_th.count):
+                    item = proj_th.item(j)
+                    item.isConstruction = True
+                    if not hasattr(item, 'startSketchPoint'):
+                        continue
+                    th_sp = item.startSketchPoint.geometry
+                    th_ep = item.endSketchPoint.geometry
+                    th_len = ((th_sp.x - th_ep.x)**2 +
+                              (th_sp.y - th_ep.y)**2) ** 0.5
+                    if th_len < 0.001:
+                        continue
+                    # Projected as a line — add driven dimension
+                    if abs(th_sp.x - th_ep.x) > abs(th_sp.y - th_ep.y):
+                        th_orient = adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation
+                    else:
+                        th_orient = adsk.fusion.DimensionOrientations.VerticalDimensionOrientation
+                    th_dim = dims.addDistanceDimension(
+                        item.startSketchPoint, item.endSketchPoint,
+                        th_orient, _midpoint_3d(th_sp, th_ep, dy=-0.5),
+                        False,
+                    )
+                    board_thickness_param = th_dim.parameter.name
+                if board_thickness_param:
+                    break
+    except Exception:
+        pass
 
-        center_pt = adsk.core.Point3D.create(cx, cy, 0)
-        circle = circles.addByCenterRadius(center_pt, radius_cm)
+    # --- Register user parameters ---
+    N = tab_count
+    fl_name = f"tabber_face_length{suffix}"
+    cd_name = f"tabber_cut_depth{suffix}"
+    tc_name = f"tabber_tab_count{suffix}"
+    nw_name = f"tabber_notch_width{suffix}"
+    tw_name = f"tabber_tab_width{suffix}"
+    hd_name = f"tabber_hole_diameter{suffix}"
 
-        # --- Add diameter dimension driven by parameter ---
+    edge_length_cm = layout["tab_width_cm"] * N + layout["notch_width_cm"] * (N + 1)
+    register_parameter(design, fl_name, edge_length_cm,
+                       expression=edge_length_param)
+    register_parameter(design, cd_name, board_thickness_cm,
+                       expression=board_thickness_param)
+    register_parameter(design, tc_name, float(N), units="",
+                       comment="Tabber: tab count")
+
+    if width_mode == 'auto':
+        nw_expr = f"{fl_name} / (2 * {tc_name} + 1)"
+        register_parameter(design, nw_name, layout["notch_width_cm"],
+                           expression=nw_expr)
+        register_parameter(design, tw_name, layout["tab_width_cm"],
+                           expression=nw_name)
+    else:
+        register_parameter(design, tw_name,
+                           manual_tab_width_cm or layout["tab_width_cm"])
+        nw_expr = f"({fl_name} - {tc_name} * {tw_name}) / ({tc_name} + 1)"
+        register_parameter(design, nw_name, layout["notch_width_cm"],
+                           expression=nw_expr)
+
+    if hole_diameter_cm:
+        register_parameter(design, hd_name, hole_diameter_cm,
+                           comment="Tabber: pilot hole diameter")
+
+    # --- Orientation-dependent keys for rectangle edge identification ---
+    if length_is_x:
+        along_orient = adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation
+        perp_orient = adsk.fusion.DimensionOrientations.VerticalDimensionOrientation
+        leading_key = 'left_line' if ux > 0 else 'right_line'
+        trailing_key = 'right_line' if ux > 0 else 'left_line'
+        edge_side_key = 'bottom_line' if perp_y > 0 else 'top_line'
+        far_side_key = 'top_line' if perp_y > 0 else 'bottom_line'
+    else:
+        along_orient = adsk.fusion.DimensionOrientations.VerticalDimensionOrientation
+        perp_orient = adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation
+        leading_key = 'bottom_line' if uy > 0 else 'top_line'
+        trailing_key = 'top_line' if uy > 0 else 'bottom_line'
+        edge_side_key = 'left_line' if perp_x > 0 else 'right_line'
+        far_side_key = 'right_line' if perp_x > 0 else 'left_line'
+
+    # --- Draw notch rectangles along the edge ---
+    notch_segments = [s for s in layout["segments"] if s["type"] == "notch"]
+    tab_segments = [s for s in layout["segments"] if s["type"] == "tab"]
+    lines_coll = sketch.sketchCurves.sketchLines
+    circles = sketch.sketchCurves.sketchCircles
+
+    rect_infos = []
+    for seg in notch_segments:
+        c1x = sp.x + ux * seg["start_cm"]
+        c1y = sp.y + uy * seg["start_cm"]
+        c2x = sp.x + ux * seg["end_cm"] + perp_x * board_thickness_cm
+        c2y = sp.y + uy * seg["end_cm"] + perp_y * board_thickness_cm
+
+        rect_lines = lines_coll.addTwoPointRectangle(
+            adsk.core.Point3D.create(c1x, c1y, 0),
+            adsk.core.Point3D.create(c2x, c2y, 0),
+        )
+        info = _identify_rect_edges(rect_lines, length_is_x)
+        rect_infos.append(info)
+
+    # --- Apply constraints and dimensions to notch rectangles ---
+    for i, info in enumerate(rect_infos):
+        # Perpendicular: lock all four corners to right angles
         try:
-            dia_dim = dims.addDiameterDimension(
-                circle,
-                adsk.core.Point3D.create(cx + radius_cm + 0.5, cy, 0),
+            constraints.addPerpendicular(info[edge_side_key], info[leading_key])
+        except Exception:
+            pass
+        try:
+            constraints.addPerpendicular(info[leading_key], info[far_side_key])
+        except Exception:
+            pass
+        try:
+            constraints.addPerpendicular(info[far_side_key], info[trailing_key])
+        except Exception:
+            pass
+        try:
+            constraints.addPerpendicular(info[trailing_key], info[edge_side_key])
+        except Exception:
+            pass
+
+        # Collinear: edge-side of rectangle sits on the projected edge
+        try:
+            constraints.addCollinear(info[edge_side_key], proj_line)
+        except Exception:
+            pass
+
+        # Width dimension (along edge) = notch_width
+        p1 = info[leading_key].startSketchPoint
+        p2 = info[trailing_key].startSketchPoint
+        try:
+            text_pos = _midpoint_3d(
+                p1.geometry, p2.geometry,
+                dy=0.5 if length_is_x else 0.0,
+                dx=0.5 if not length_is_x else 0.0,
             )
-            dia_dim.parameter.expression = hd_name
+            w_dim = dims.addDistanceDimension(p1, p2, along_orient, text_pos)
+            w_dim.parameter.expression = nw_name
         except Exception:
             pass
 
-        # --- Add along-edge dimension from projected edge start to circle center ---
+        # Height dimension (perpendicular to edge) = board thickness
+        p3 = info[edge_side_key].startSketchPoint
+        p4 = info[far_side_key].startSketchPoint
         try:
-            if length_is_x:
+            text_pos = _midpoint_3d(
+                p3.geometry, p4.geometry,
+                dx=-0.5 if length_is_x else 0.0,
+                dy=-0.5 if not length_is_x else 0.0,
+            )
+            h_dim = dims.addDistanceDimension(p3, p4, perp_orient, text_pos)
+            h_dim.parameter.expression = cd_name
+        except Exception:
+            pass
+
+        # Gap to next rectangle = tab_width
+        if i < len(rect_infos) - 1:
+            next_info = rect_infos[i + 1]
+            gap_p1 = info[trailing_key].startSketchPoint
+            gap_p2 = next_info[leading_key].startSketchPoint
+            try:
+                text_pos = _midpoint_3d(
+                    gap_p1.geometry, gap_p2.geometry,
+                    dy=-0.5 if length_is_x else 0.0,
+                    dx=-0.5 if not length_is_x else 0.0,
+                )
+                gap_dim = dims.addDistanceDimension(
+                    gap_p1, gap_p2, along_orient, text_pos,
+                )
+                gap_dim.parameter.expression = tw_name
+            except Exception:
+                pass
+
+    # Anchor first rectangle's edge-side/leading corner to projected edge start
+    if rect_infos:
+        try:
+            corner = _get_corner_point(
+                rect_infos[0][edge_side_key], rect_infos[0][leading_key],
+            )
+            constraints.addCoincident(corner, proj_line.startSketchPoint)
+        except Exception:
+            pass
+
+    # --- Draw pilot hole circles at tab centers with parametric dimensions ---
+    if hole_diameter_cm:
+        radius_cm = hole_diameter_cm / 2
+        perp_offset_cm = board_thickness_cm / 2
+
+        for i, seg in enumerate(tab_segments):
+            center_along = (seg["start_cm"] + seg["end_cm"]) / 2
+            cx = sp.x + ux * center_along + perp_x * perp_offset_cm
+            cy = sp.y + uy * center_along + perp_y * perp_offset_cm
+
+            center_pt = adsk.core.Point3D.create(cx, cy, 0)
+            circle = circles.addByCenterRadius(center_pt, radius_cm)
+
+            # Diameter dimension driven by parameter
+            try:
+                dia_dim = dims.addDiameterDimension(
+                    circle,
+                    adsk.core.Point3D.create(cx + radius_cm + 0.5, cy, 0),
+                )
+                dia_dim.parameter.expression = hd_name
+            except Exception:
+                pass
+
+            # Along-edge dimension from projected edge start to circle center
+            try:
+                if length_is_x:
+                    text_pt = adsk.core.Point3D.create(cx, cy - 0.5, 0)
+                else:
+                    text_pt = adsk.core.Point3D.create(cx - 0.5, cy, 0)
                 along_dim = dims.addDistanceDimension(
                     proj_line.startSketchPoint,
                     circle.centerSketchPoint,
-                    adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation,
-                    adsk.core.Point3D.create(cx, cy - 0.5, 0),
+                    along_orient, text_pt,
                 )
-            else:
-                along_dim = dims.addDistanceDimension(
-                    proj_line.startSketchPoint,
-                    circle.centerSketchPoint,
-                    adsk.fusion.DimensionOrientations.VerticalDimensionOrientation,
-                    adsk.core.Point3D.create(cx - 0.5, cy, 0),
+                # Tab i center = (i+1) * notch_width + (i + 0.5) * tab_width
+                along_dim.parameter.expression = (
+                    f"({i + 1}) * {nw_name} + ({i} + 0.5) * {tw_name}"
                 )
-            # Expression: (i + 0.5) * notch_width + i * tab_width
-            nw_name = f"tabber_notch_width{suffix}"
-            tw_name = f"tabber_tab_width{suffix}"
-            along_dim.parameter.expression = f"({i} + 0.5) * {nw_name} + {i} * {tw_name}"
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        # --- Add perpendicular dimension from projected edge to circle center ---
-        try:
-            if length_is_x:
+            # Perpendicular dimension from projected edge to circle center
+            try:
+                if length_is_x:
+                    text_pt = adsk.core.Point3D.create(cx - 0.5, cy, 0)
+                else:
+                    text_pt = adsk.core.Point3D.create(cx, cy - 0.5, 0)
                 perp_dim = dims.addDistanceDimension(
                     proj_line.startSketchPoint,
                     circle.centerSketchPoint,
-                    adsk.fusion.DimensionOrientations.VerticalDimensionOrientation,
-                    adsk.core.Point3D.create(cx - 0.5, cy, 0),
+                    perp_orient, text_pt,
                 )
-            else:
-                perp_dim = dims.addDistanceDimension(
-                    proj_line.startSketchPoint,
-                    circle.centerSketchPoint,
-                    adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation,
-                    adsk.core.Point3D.create(cx, cy - 0.5, 0),
-                )
-            cd_name = f"tabber_cut_depth{suffix}"
-            perp_dim.parameter.expression = f"{cd_name} / 2"
-        except Exception:
-            pass
+                perp_dim.parameter.expression = f"{cd_name} / 2"
+            except Exception:
+                pass
 
-    return sketch
+    return sketch, suffix
 
 
 def register_parameter(design, name, value_cm, units="cm", expression=None,

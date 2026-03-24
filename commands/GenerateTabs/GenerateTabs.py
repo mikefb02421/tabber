@@ -73,15 +73,16 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'selectionModeInput', 'Selection Mode',
                 adsk.core.DropDownStyles.TextListDropDownStyle,
             )
-            sel_mode_input.listItems.add('Edge', True)
-            sel_mode_input.listItems.add('Face+Edge', False)
+            sel_mode_input.listItems.add('Edge', False)
+            sel_mode_input.listItems.add('Face+Edge', True)
 
             # Face selection (Edge mode)
             face_input = inputs.addSelectionInput(
                 'faceSelectInput', 'Face', 'Select a planar face',
             )
             face_input.addSelectionFilter('PlanarFaces')
-            face_input.setSelectionLimits(1, 1)
+            face_input.setSelectionLimits(0, 0)
+            face_input.isVisible = False
 
             # Top Face selection (Face+Edge mode)
             top_face_input = inputs.addSelectionInput(
@@ -89,7 +90,6 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             )
             top_face_input.addSelectionFilter('PlanarFaces')
             top_face_input.setSelectionLimits(1, 1)
-            top_face_input.isVisible = False
 
             # Edge selection (Face+Edge mode)
             edge_input = inputs.addSelectionInput(
@@ -97,7 +97,6 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             )
             edge_input.addSelectionFilter('LinearEdges')
             edge_input.setSelectionLimits(1, 1)
-            edge_input.isVisible = False
 
             # Tab count
             inputs.addIntegerSpinnerCommandInput(
@@ -119,17 +118,25 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             )
             tab_width_input.isVisible = False  # Hidden when Automatic
 
+            # Pilot holes toggle (Face+Edge mode)
+            inputs.addBoolValueInput('pilotHolesInput', 'Pilot Holes', True, '', True)
+
             # Hole diameter (Face+Edge mode, inches)
             hole_dia_input = inputs.addFloatSpinnerCommandInput(
                 'holeDiameterInput', 'Hole Diameter',
                 'in', 0.01, 2.0, 0.0625, 0.125,
             )
-            hole_dia_input.isVisible = False
+            # Preview checkbox
+            inputs.addBoolValueInput('previewInput', 'Preview', True, '', True)
 
             # Register event handlers
             on_execute = TabberExecuteHandler()
             cmd.execute.add(on_execute)
             _handlers.append(on_execute)
+
+            on_preview = TabberExecutePreviewHandler()
+            cmd.executePreview.add(on_preview)
+            _handlers.append(on_preview)
 
             on_input_changed = TabberInputChangedHandler()
             cmd.inputChanged.add(on_input_changed)
@@ -148,6 +155,135 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             app.userInterface.messageBox(traceback.format_exc())
 
 
+def _build_geometry(inputs):
+    """Shared logic for execute and preview — reads inputs, builds sketches and cuts.
+
+    Returns (suffix, start_index) on success, or None if required inputs
+    are not yet filled in (e.g. no face selected during preview).
+    """
+    app = adsk.core.Application.get()
+    design = adsk.fusion.Design.cast(app.activeProduct)
+
+    # Force-reload lib modules to pick up code changes
+    import importlib, sys
+    for mod_name in list(sys.modules.keys()):
+        if 'Tabber' in mod_name and 'lib' in mod_name:
+            del sys.modules[mod_name]
+    from ...lib import geometry as _geo, sketch_builder as _sb, cut_builder as _cb
+
+    # Read common inputs
+    sel_mode_input = inputs.itemById('selectionModeInput')
+    selection_mode = sel_mode_input.selectedItem.name  # 'Edge' or 'Face+Edge'
+
+    tab_count_input = inputs.itemById('tabCountInput')
+    tab_count = tab_count_input.value
+
+    width_mode_input = inputs.itemById('widthModeInput')
+    width_mode_name = width_mode_input.selectedItem.name
+
+    tab_width_input = inputs.itemById('tabWidthInput')
+    manual_width_cm = tab_width_input.value
+
+    width_mode = 'auto' if width_mode_name == 'Automatic' else 'manual'
+
+    timeline = design.timeline
+    start_index = timeline.count
+
+    if selection_mode == 'Edge':
+        # --- Edge mode (original flow) ---
+        face_input = inputs.itemById('faceSelectInput')
+        if face_input.selectionCount < 1:
+            return None
+        face = face_input.selection(0).entity
+        component = face.body.parentComponent
+
+        dims = _geo.get_face_dimensions(face)
+
+        tab_layout = layout_mod.calculate_layout(
+            face_length_cm=dims["length_cm"],
+            tab_count=tab_count,
+            width_mode=width_mode,
+            manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
+        )
+
+        sketch, suffix = _sb.build_tab_sketch(
+            component, face, tab_layout, dims["height_cm"],
+            width_mode=width_mode,
+            tab_count=tab_count,
+            manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
+        )
+        _cb.build_cuts(component, face, sketch, dims["height_cm"],
+                       param_suffix=suffix)
+
+    else:
+        # --- Face+Edge mode: single sketch on top face ---
+        top_face_input = inputs.itemById('topFaceInput')
+        edge_input = inputs.itemById('edgeSelectInput')
+        if top_face_input.selectionCount < 1 or edge_input.selectionCount < 1:
+            return None
+        top_face = top_face_input.selection(0).entity
+        selected_edge = edge_input.selection(0).entity
+
+        pilot_holes_input = inputs.itemById('pilotHolesInput')
+        include_holes = pilot_holes_input.value
+
+        hole_dia_input = inputs.itemById('holeDiameterInput')
+        hole_diameter_cm = hole_dia_input.value if include_holes else 0
+
+        # Find the edge face to get board thickness
+        edge_face = _geo.find_edge_face(selected_edge, top_face)
+        if edge_face is None:
+            raise RuntimeError(
+                "Tabber: could not find the edge face adjacent to "
+                "the selected edge. Ensure the edge borders two faces."
+            )
+
+        component = top_face.body.parentComponent
+
+        edge_length_cm = _geo.get_edge_length(selected_edge)
+        edge_dims = _geo.get_face_dimensions(edge_face)
+        board_thickness_cm = edge_dims["height_cm"]
+
+        tab_layout = layout_mod.calculate_layout(
+            face_length_cm=edge_length_cm,
+            tab_count=tab_count,
+            width_mode=width_mode,
+            manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
+        )
+
+        # Single sketch on top face with notch rectangles + pilot holes
+        sketch, suffix = _sb.build_face_edge_sketch(
+            component, top_face, selected_edge, tab_layout,
+            board_thickness_cm, hole_diameter_cm,
+            width_mode=width_mode,
+            tab_count=tab_count,
+            manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
+        )
+        # Single ThroughAll extrude for all profiles
+        _cb.build_hole_cuts(component, top_face, sketch)
+
+    return (suffix, start_index)
+
+
+class TabberExecutePreviewHandler(adsk.core.CommandEventHandler):
+    """Generates preview geometry when dialog inputs change."""
+
+    def __init__(self):
+        super().__init__()
+
+    def notify(self, args):
+        try:
+            inputs = args.command.commandInputs
+            preview_input = inputs.itemById('previewInput')
+            if not preview_input.value:
+                args.isValidResult = False
+                return
+            result = _build_geometry(inputs)
+            args.isValidResult = result is not None
+        except Exception:
+            args.isValidResult = False
+
+
 class TabberExecuteHandler(adsk.core.CommandEventHandler):
     """Reads inputs and calls lib/ modules to create geometry."""
 
@@ -159,110 +295,14 @@ class TabberExecuteHandler(adsk.core.CommandEventHandler):
             app = adsk.core.Application.get()
             design = adsk.fusion.Design.cast(app.activeProduct)
 
-            cmd = args.command
-            inputs = cmd.commandInputs
+            result = _build_geometry(args.command.commandInputs)
+            if result is None:
+                return
 
-            # Force-reload lib modules to pick up code changes
-            import importlib, sys
-            for mod_name in list(sys.modules.keys()):
-                if 'Tabber' in mod_name and 'lib' in mod_name:
-                    del sys.modules[mod_name]
-            from ...lib import geometry as _geo, sketch_builder as _sb, cut_builder as _cb
-
-            # Read common inputs
-            sel_mode_input = inputs.itemById('selectionModeInput')
-            selection_mode = sel_mode_input.selectedItem.name  # 'Edge' or 'Face+Edge'
-
-            tab_count_input = inputs.itemById('tabCountInput')
-            tab_count = tab_count_input.value
-
-            width_mode_input = inputs.itemById('widthModeInput')
-            width_mode_name = width_mode_input.selectedItem.name
-
-            tab_width_input = inputs.itemById('tabWidthInput')
-            manual_width_cm = tab_width_input.value
-
-            width_mode = 'auto' if width_mode_name == 'Automatic' else 'manual'
-
-            timeline = design.timeline
-            start_index = timeline.count
-
-            if selection_mode == 'Edge':
-                # --- Edge mode (original flow) ---
-                face_input = inputs.itemById('faceSelectInput')
-                face = face_input.selection(0).entity
-                component = face.body.parentComponent
-
-                dims = _geo.get_face_dimensions(face)
-
-                tab_layout = layout_mod.calculate_layout(
-                    face_length_cm=dims["length_cm"],
-                    tab_count=tab_count,
-                    width_mode=width_mode,
-                    manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
-                )
-
-                sketch, suffix = _sb.build_tab_sketch(
-                    component, face, tab_layout, dims["height_cm"],
-                    width_mode=width_mode,
-                    tab_count=tab_count,
-                    manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
-                )
-                _cb.build_cuts(component, face, sketch, dims["height_cm"],
-                               param_suffix=suffix)
-
-            else:
-                # --- Face+Edge mode ---
-                top_face_input = inputs.itemById('topFaceInput')
-                top_face = top_face_input.selection(0).entity
-
-                edge_input = inputs.itemById('edgeSelectInput')
-                selected_edge = edge_input.selection(0).entity
-
-                hole_dia_input = inputs.itemById('holeDiameterInput')
-                hole_diameter_cm = hole_dia_input.value  # Fusion stores in cm
-
-                # Find the edge face (perpendicular face adjacent to the edge)
-                edge_face = _geo.find_edge_face(selected_edge, top_face)
-                if edge_face is None:
-                    raise RuntimeError(
-                        "Tabber: could not find the edge face adjacent to "
-                        "the selected edge. Ensure the edge borders two faces."
-                    )
-
-                component = top_face.body.parentComponent
-
-                # Edge face dimensions: length from edge, height = board thickness
-                edge_length_cm = _geo.get_edge_length(selected_edge)
-                edge_dims = _geo.get_face_dimensions(edge_face)
-                board_thickness_cm = edge_dims["height_cm"]
-
-                tab_layout = layout_mod.calculate_layout(
-                    face_length_cm=edge_length_cm,
-                    tab_count=tab_count,
-                    width_mode=width_mode,
-                    manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
-                )
-
-                # Build tab sketch and cuts on the edge face
-                sketch, suffix = _sb.build_tab_sketch(
-                    component, edge_face, tab_layout, board_thickness_cm,
-                    width_mode=width_mode,
-                    tab_count=tab_count,
-                    manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
-                )
-                _cb.build_cuts(component, edge_face, sketch, board_thickness_cm,
-                               param_suffix=suffix)
-
-                # Build pilot hole sketch and cuts on the top face
-                hole_sketch = _sb.build_pilot_hole_sketch(
-                    component, top_face, selected_edge, tab_layout,
-                    board_thickness_cm, hole_diameter_cm,
-                    suffix=suffix,
-                )
-                _cb.build_hole_cuts(component, top_face, hole_sketch)
+            suffix, start_index = result
 
             # Group all new timeline items
+            timeline = design.timeline
             end_index = timeline.count - 1
             if end_index > start_index:
                 group = timeline.timelineGroups.add(start_index, end_index)
@@ -291,11 +331,38 @@ class TabberInputChangedHandler(adsk.core.InputChangedEventHandler):
             sel_mode_input = inputs.itemById('selectionModeInput')
             is_face_edge = sel_mode_input.selectedItem.name == 'Face+Edge'
 
-            # Toggle inputs by selection mode
-            inputs.itemById('faceSelectInput').isVisible = not is_face_edge
-            inputs.itemById('topFaceInput').isVisible = is_face_edge
-            inputs.itemById('edgeSelectInput').isVisible = is_face_edge
-            inputs.itemById('holeDiameterInput').isVisible = is_face_edge
+            # Toggle inputs by selection mode — also update selection limits
+            # so hidden inputs with min=1 don't block Fusion's internal validation
+            face_input = inputs.itemById('faceSelectInput')
+            top_face_input = inputs.itemById('topFaceInput')
+            edge_input = inputs.itemById('edgeSelectInput')
+
+            face_input.isVisible = not is_face_edge
+            top_face_input.isVisible = is_face_edge
+            edge_input.isVisible = is_face_edge
+
+            pilot_holes_input = inputs.itemById('pilotHolesInput')
+            pilot_holes_input.isVisible = is_face_edge
+            inputs.itemById('holeDiameterInput').isVisible = is_face_edge and pilot_holes_input.value
+
+            if is_face_edge:
+                face_input.setSelectionLimits(0, 0)
+                top_face_input.setSelectionLimits(1, 1)
+                edge_input.setSelectionLimits(1, 1)
+            else:
+                face_input.setSelectionLimits(1, 1)
+                top_face_input.setSelectionLimits(0, 0)
+                edge_input.setSelectionLimits(0, 0)
+
+            # Auto-advance focus to the next selection input
+            if changed_input.id == 'selectionModeInput':
+                if is_face_edge:
+                    top_face_input.hasFocus = True
+                else:
+                    face_input.hasFocus = True
+            elif changed_input.id == 'topFaceInput':
+                if top_face_input.selectionCount >= 1:
+                    edge_input.hasFocus = True
 
             # Toggle manual tab width visibility
             width_mode_input = inputs.itemById('widthModeInput')
