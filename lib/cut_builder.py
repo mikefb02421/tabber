@@ -50,7 +50,7 @@ def build_cuts(component, face, sketch, depth_cm, param_suffix=""):
     return features
 
 
-def build_hole_cuts(component, face, sketch):
+def build_hole_cuts(component, sketch=None, face=None, target_body=None):
     """
     For each closed profile in `sketch`, create an extrude-cut with
     Through All extent, restricted to the target body only.
@@ -64,7 +64,8 @@ def build_hole_cuts(component, face, sketch):
     if profile_count == 0:
         return features
 
-    target_body = face.body
+    if target_body is None:
+        target_body = face.body
 
     for pi in range(profile_count):
         profile = sketch.profiles.item(pi)

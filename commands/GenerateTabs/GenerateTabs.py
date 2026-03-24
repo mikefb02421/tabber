@@ -91,12 +91,12 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
             top_face_input.addSelectionFilter('PlanarFaces')
             top_face_input.setSelectionLimits(1, 1)
 
-            # Edge selection (Face+Edge mode)
+            # Edge selection (Face+Edge mode, multiple allowed)
             edge_input = inputs.addSelectionInput(
-                'edgeSelectInput', 'Edge', 'Select an edge on the top face',
+                'edgeSelectInput', 'Edges', 'Select one or more edges on the top face',
             )
             edge_input.addSelectionFilter('LinearEdges')
-            edge_input.setSelectionLimits(1, 1)
+            edge_input.setSelectionLimits(1, 0)
 
             # Tab count
             inputs.addIntegerSpinnerCommandInput(
@@ -126,8 +126,9 @@ class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 'holeDiameterInput', 'Hole Diameter',
                 'in', 0.01, 2.0, 0.0625, 0.125,
             )
-            # Preview checkbox
-            inputs.addBoolValueInput('previewInput', 'Preview', True, '', True)
+            # Preview checkbox (hidden in Face+Edge mode, which is the default)
+            preview_input = inputs.addBoolValueInput('previewInput', 'Preview', True, '', True)
+            preview_input.isVisible = False
 
             # Register event handlers
             on_execute = TabberExecuteHandler()
@@ -194,8 +195,11 @@ def _build_geometry(inputs):
         face_input = inputs.itemById('faceSelectInput')
         if face_input.selectionCount < 1:
             return None
-        face = face_input.selection(0).entity
-        component = face.body.parentComponent
+        try:
+            face = face_input.selection(0).entity
+            component = face.body.parentComponent
+        except RuntimeError:
+            return None
 
         dims = _geo.get_face_dimensions(face)
 
@@ -216,13 +220,18 @@ def _build_geometry(inputs):
                        param_suffix=suffix)
 
     else:
-        # --- Face+Edge mode: single sketch on top face ---
+        # --- Face+Edge mode: one sketch per selected edge ---
         top_face_input = inputs.itemById('topFaceInput')
         edge_input = inputs.itemById('edgeSelectInput')
         if top_face_input.selectionCount < 1 or edge_input.selectionCount < 1:
             return None
-        top_face = top_face_input.selection(0).entity
-        selected_edge = edge_input.selection(0).entity
+
+        # Selections can become stale after preview rollback
+        try:
+            top_face = top_face_input.selection(0).entity
+            component = top_face.body.parentComponent
+        except RuntimeError:
+            return None
 
         pilot_holes_input = inputs.itemById('pilotHolesInput')
         include_holes = pilot_holes_input.value
@@ -230,37 +239,50 @@ def _build_geometry(inputs):
         hole_dia_input = inputs.itemById('holeDiameterInput')
         hole_diameter_cm = hole_dia_input.value if include_holes else 0
 
-        # Find the edge face to get board thickness
-        edge_face = _geo.find_edge_face(selected_edge, top_face)
-        if edge_face is None:
-            raise RuntimeError(
-                "Tabber: could not find the edge face adjacent to "
-                "the selected edge. Ensure the edge borders two faces."
+        # Collect edges safely — selectionCount can be stale during preview
+        edges = []
+        for ei in range(edge_input.selectionCount):
+            try:
+                edges.append(edge_input.selection(ei).entity)
+            except RuntimeError:
+                break
+        if not edges:
+            return None
+
+        # Build all sketches first (BRep stays valid), then extrude after
+        sketches = []
+        for selected_edge in edges:
+            edge_face = _geo.find_edge_face(selected_edge, top_face)
+            if edge_face is None:
+                raise RuntimeError(
+                    "Tabber: could not find the edge face adjacent to "
+                    "the selected edge. Ensure the edge borders two faces."
+                )
+
+            edge_length_cm = _geo.get_edge_length(selected_edge)
+            edge_dims = _geo.get_face_dimensions(edge_face)
+            board_thickness_cm = edge_dims["height_cm"]
+
+            tab_layout = layout_mod.calculate_layout(
+                face_length_cm=edge_length_cm,
+                tab_count=tab_count,
+                width_mode=width_mode,
+                manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
             )
 
-        component = top_face.body.parentComponent
+            sketch, suffix = _sb.build_face_edge_sketch(
+                component, top_face, selected_edge, tab_layout,
+                board_thickness_cm, hole_diameter_cm,
+                width_mode=width_mode,
+                tab_count=tab_count,
+                manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
+            )
+            sketches.append(sketch)
 
-        edge_length_cm = _geo.get_edge_length(selected_edge)
-        edge_dims = _geo.get_face_dimensions(edge_face)
-        board_thickness_cm = edge_dims["height_cm"]
-
-        tab_layout = layout_mod.calculate_layout(
-            face_length_cm=edge_length_cm,
-            tab_count=tab_count,
-            width_mode=width_mode,
-            manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
-        )
-
-        # Single sketch on top face with notch rectangles + pilot holes
-        sketch, suffix = _sb.build_face_edge_sketch(
-            component, top_face, selected_edge, tab_layout,
-            board_thickness_cm, hole_diameter_cm,
-            width_mode=width_mode,
-            tab_count=tab_count,
-            manual_tab_width_cm=manual_width_cm if width_mode == 'manual' else None,
-        )
-        # Single ThroughAll extrude for all profiles
-        _cb.build_hole_cuts(component, top_face, sketch)
+        # Extrude all sketches
+        target_body = top_face.body
+        for sketch in sketches:
+            _cb.build_hole_cuts(component, sketch, target_body=target_body)
 
     return (suffix, start_index)
 
@@ -274,10 +296,18 @@ class TabberExecutePreviewHandler(adsk.core.CommandEventHandler):
     def notify(self, args):
         try:
             inputs = args.command.commandInputs
+            # No preview in Face+Edge mode — extrude cuts invalidate
+            # edge entities, preventing multi-edge selection
+            sel_mode = inputs.itemById('selectionModeInput')
+            if sel_mode.selectedItem.name == 'Face+Edge':
+                args.isValidResult = False
+                return
+
             preview_input = inputs.itemById('previewInput')
             if not preview_input.value:
                 args.isValidResult = False
                 return
+
             result = _build_geometry(inputs)
             args.isValidResult = result is not None
         except Exception:
@@ -344,11 +374,12 @@ class TabberInputChangedHandler(adsk.core.InputChangedEventHandler):
             pilot_holes_input = inputs.itemById('pilotHolesInput')
             pilot_holes_input.isVisible = is_face_edge
             inputs.itemById('holeDiameterInput').isVisible = is_face_edge and pilot_holes_input.value
+            inputs.itemById('previewInput').isVisible = not is_face_edge
 
             if is_face_edge:
                 face_input.setSelectionLimits(0, 0)
                 top_face_input.setSelectionLimits(1, 1)
-                edge_input.setSelectionLimits(1, 1)
+                edge_input.setSelectionLimits(1, 0)
             else:
                 face_input.setSelectionLimits(1, 1)
                 top_face_input.setSelectionLimits(0, 0)
