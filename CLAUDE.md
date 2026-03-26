@@ -299,79 +299,62 @@ that splitting into separate handler files would add complexity without benefit.
 
 **Dialog inputs (in order):**
 
-| Input | Type | ID | Default |
-|---|---|---|---|
-| Placement | Dropdown | `'placementInput'` | Dual Edge |
-| Face | Selection (PlanarFaces, 1–1) | `'faceSelectInput'` | — |
-| Secondary Face | Selection (PlanarFaces, 0–1) | `'secondaryFaceInput'` | — |
-| Number of tabs | Integer spinner (1–50) | `'tabCountInput'` | 3 |
-| Width mode | Dropdown | `'widthModeInput'` | Automatic |
-| Tab width | Float spinner (mm) | `'tabWidthInput'` | 8.0mm |
-| Warning message | Text box (read-only) | `'warningMsgInput'` | hidden |
+| Input | Type | ID | Default | Visibility |
+|---|---|---|---|---|
+| Selection Mode | Dropdown | `'selectionModeInput'` | Face+Edge | always |
+| Face | Selection (PlanarFaces, 1–1) | `'faceSelectInput'` | — | Edge mode only |
+| Top Face | Selection (PlanarFaces, 1–1) | `'topFaceInput'` | — | Face+Edge mode only |
+| Edges | Selection (LinearEdges, 1–∞) | `'edgeSelectInput'` | — | Face+Edge mode only |
+| Number of Tabs | Integer spinner (1–50) | `'tabCountInput'` | 3 | always |
+| Width Mode | Dropdown | `'widthModeInput'` | Automatic | always |
+| Tab Width | Float spinner (mm) | `'tabWidthInput'` | 8.0mm | Manual width mode only |
+| Pilot Holes | Bool checkbox | `'pilotHolesInput'` | checked | Face+Edge mode only |
+| Hole Diameter | Float spinner (in) | `'holeDiameterInput'` | 0.125" | Face+Edge + Pilot Holes on |
+| Preview | Bool checkbox | `'previewInput'` | checked | Edge mode only |
 
 **Dialog behavior:**
 - `tabWidthInput` is hidden when width mode = Automatic. Show it only when Manual.
-- `secondaryFaceInput` is hidden when placement = Single. Show it when Dual.
-- When placement = Dual and a primary face is selected, attempt to auto-detect
-  the opposite face and pre-populate `secondaryFaceInput`.
-- If auto-detection finds no opposite face, show `warningMsgInput` with text:
-  `"No opposite face detected. Switch to Single Edge or select manually."`
-  Do NOT disable the OK button or raise an error.
-- `warningMsgInput` is hidden by default, shown only when the warning applies.
+- Face+Edge is the default selection mode.
+- In Edge mode, the Face selection and Preview checkbox are shown.
+- In Face+Edge mode, Top Face, Edges (multi-select), Pilot Holes, and
+  Hole Diameter inputs are shown. Preview is disabled (see below).
+- `holeDiameterInput` is hidden when Pilot Holes is unchecked.
+- When switching selection mode, hidden selection inputs have their limits
+  set to (0, 0) so they don't block Fusion's internal validation.
+- Auto-advance focus: selecting a top face advances focus to edge input.
 
-**Event handlers to implement:**
-
-```python
-class TabberCommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
-    # Registers all sub-handlers, builds dialog inputs
-
-class TabberExecuteHandler(adsk.core.CommandEventHandler):
-    # Reads inputs, calls lib/ modules to create geometry
-
-class TabberInputChangedHandler(adsk.core.InputChangedEventHandler):
-    # Shows/hides tabWidthInput and secondaryFaceInput
-    # Triggers opposite face auto-detection when face selection changes
-
-class TabberSelectionHandler(adsk.core.SelectionEventHandler):
-    # Filters selection to planar faces only
-
-class TabberValidateHandler(adsk.core.ValidateInputsEventHandler):
-    # Ensures at least one face is selected before enabling OK
-    # Does NOT block on missing opposite face (that's a warning, not an error)
-```
-
-**Execute flow:**
+**Event handlers:**
 
 ```python
-def notify(self, args):
-    # 1. Read all inputs
-    face         = faceSelectInput.selection(0).entity
-    tab_count    = tabCountInput.value
-    width_mode   = widthModeInput.selectedItem.name   # 'Automatic' or 'Manual'
-    placement    = placementInput.selectedItem.name   # 'Single Edge' or 'Dual Edge'
-    manual_width = tabWidthInput.value                # cm (Fusion units)
-
-    # 2. Get face dimensions
-    dims = geometry.get_face_dimensions(face)
-
-    # 3. Calculate layout
-    layout = layout.calculate_layout(
-        face_length_cm    = dims["length_cm"],
-        tab_count         = tab_count,
-        width_mode        = 'auto' if width_mode == 'Automatic' else 'manual',
-        manual_tab_width_cm = manual_width if width_mode == 'Manual' else None,
-    )
-
-    # 4. Build sketch and cuts on primary face
-    sketch = sketch_builder.build_tab_sketch(component, face, layout, dims["height_cm"])
-    cut_builder.build_cuts(component, face, sketch, dims["height_cm"])
-
-    # 5. If dual mode, build mirror cuts on opposite face
-    if placement == 'Dual Edge':
-        opposite = secondaryFaceInput.selection(0).entity if secondaryFaceInput.selectionCount > 0 else None
-        if opposite:
-            cut_builder.build_mirror_cuts(component, face, opposite, layout, dims["height_cm"])
+class TabberCommandCreatedHandler  # Registers all sub-handlers, builds dialog inputs
+class TabberExecutePreviewHandler  # Live preview (Edge mode only, skipped for Face+Edge)
+class TabberExecuteHandler         # Final geometry creation + timeline grouping
+class TabberInputChangedHandler    # Shows/hides inputs based on mode, auto-advance focus
+class TabberSelectionHandler       # Filters selection to planar faces / linear edges
+class TabberValidateHandler        # Ensures required selections before enabling OK
 ```
+
+**Architecture — `_build_geometry(inputs)` helper:**
+
+Both execute and preview call a shared module-level function `_build_geometry(inputs)`
+that reads all dialog inputs and builds geometry. Returns `(suffix, start_index)` or
+`None` if required selections are missing. The execute handler adds timeline grouping
+on top. The preview handler checks selection mode and preview checkbox first.
+
+**Execute flow — Edge mode:**
+1. Read face → get dimensions → calculate layout
+2. `build_tab_sketch()` → `build_cuts()` (distance extent)
+
+**Execute flow — Face+Edge mode (multi-edge):**
+1. Read top face + collect all selected edges
+2. For each edge: find edge face → get board thickness → calculate layout → `build_face_edge_sketch()`
+3. All sketches built first (BRep stays valid), then all extrudes via `build_hole_cuts()`
+4. Group all timeline items into a single named group
+
+**Preview:**
+- Edge mode: full real-time preview with extrude cuts (toggle via Preview checkbox)
+- Face+Edge mode: preview disabled — extrude cuts invalidate BRep edge entities,
+  which prevents multi-edge selection. Geometry created only on OK click.
 
 ---
 
@@ -622,8 +605,25 @@ def test_always_starts_and_ends_with_notch():
 ## Scope boundaries (v1)
 
 - Rectangular faces only — no irregular shapes
-- One face selection per run — no batch processing
 - No kerf adjustment — out of scope for v1
-- No preview mode — implement execute only, no executePreview
-- No undo grouping beyond what Fusion provides automatically
 - Metric and imperial both supported via unitsManager
+
+## Known constraints and design decisions
+
+- **Preview disabled in Face+Edge mode:** Extrude cuts during preview rebuild the
+  BRep, invalidating edge entities that Fusion's selection input tracks. This makes
+  it impossible to select additional edges after preview runs. Preview is therefore
+  disabled for Face+Edge mode. Edge mode (single face) has full real-time preview.
+
+- **Multi-edge: sketches first, extrudes second:** When multiple edges are selected,
+  all sketches are built in a first pass (BRep stays unmodified, all edge/face
+  entities remain valid), then all extrudes happen in a second pass. This avoids
+  stale entity errors between edges.
+
+- **`build_hole_cuts` accepts `target_body`:** The body reference is captured once
+  before extrudes begin and passed directly, since `face.body` goes stale after
+  the first extrude cut.
+
+- **Stale entity guards:** Selection access is wrapped in try/except RuntimeError
+  throughout `_build_geometry()`, returning None (no-op) if entities are invalid.
+  Edge collection uses a break-on-error loop since `selectionCount` can be stale.
